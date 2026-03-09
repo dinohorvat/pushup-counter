@@ -10,7 +10,7 @@ from pathlib import Path
 
 import json
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -122,6 +122,43 @@ def list_sessions(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, g
     return {"sessions": [dict(r) for r in rows], "total": total}
 
 
+class SessionUpdate(BaseModel):
+    reps: int
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: int):
+    conn = get_db()
+    cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    await broadcast({"type": "session_deleted", "id": session_id})
+    return {"status": "ok"}
+
+
+@app.patch("/api/sessions/{session_id}")
+async def update_session(session_id: int, body: SessionUpdate):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Session not found")
+    # Recalculate avg_pace based on new reps
+    duration = row["duration"]
+    new_pace = round(duration / body.reps, 2) if body.reps > 0 else 0
+    conn.execute(
+        "UPDATE sessions SET reps = ?, avg_pace = ? WHERE id = ?",
+        (body.reps, new_pace, session_id),
+    )
+    conn.commit()
+    conn.close()
+    await broadcast({"type": "session_updated", "id": session_id, "reps": body.reps})
+    return {"status": "ok"}
+
+
 @app.get("/api/stats")
 def stats():
     conn = get_db()
@@ -222,7 +259,30 @@ DASHBOARD_HTML = """\
   .session .left{display:flex;flex-direction:column;gap:2px}
   .session .date{font-size:.85rem;font-weight:500}
   .session .meta{font-size:.75rem;color:var(--dim)}
+  .session .right{display:flex;align-items:center;gap:12px}
   .session .reps{font-size:1.25rem;font-weight:700;color:var(--accent2)}
+  .session .actions{display:flex;gap:4px;opacity:0;transition:opacity .15s}
+  .session:hover .actions{opacity:1}
+  .action-btn{background:none;border:1px solid var(--border);border-radius:6px;
+    color:var(--dim);cursor:pointer;padding:4px 8px;font-size:.75rem;transition:all .15s}
+  .action-btn:hover{border-color:var(--accent);color:var(--accent2)}
+  .action-btn.del:hover{border-color:#ef4444;color:#ef4444}
+
+  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);
+    z-index:100;align-items:center;justify-content:center}
+  .modal-overlay.active{display:flex}
+  .modal{background:var(--card);border:1px solid var(--border);border-radius:14px;
+    padding:24px;width:min(340px,90vw)}
+  .modal h3{font-size:1rem;margin-bottom:16px;font-weight:600}
+  .modal input{width:100%;padding:10px 12px;background:var(--bg);border:1px solid var(--border);
+    border-radius:8px;color:var(--text);font-size:1rem;outline:none;margin-bottom:16px}
+  .modal input:focus{border-color:var(--accent)}
+  .modal-btns{display:flex;gap:8px;justify-content:flex-end}
+  .modal-btns button{padding:8px 16px;border-radius:8px;border:none;cursor:pointer;
+    font-size:.85rem;font-weight:500}
+  .btn-cancel{background:var(--border);color:var(--text)}
+  .btn-save{background:var(--accent);color:#fff}
+  .btn-save:hover{background:var(--accent2)}
 
   .live-banner{display:none;align-items:center;gap:10px;padding:14px 18px;
     background:linear-gradient(135deg,#1e1b4b,#312e81);border:1px solid #4338ca;
@@ -255,6 +315,16 @@ DASHBOARD_HTML = """\
 <div class="sessions">
   <h2>Set History</h2>
   <div id="list"></div>
+</div>
+<div class="modal-overlay" id="editModal">
+  <div class="modal">
+    <h3>Edit Set</h3>
+    <input type="number" id="editReps" min="1" placeholder="Reps">
+    <div class="modal-btns">
+      <button class="btn-cancel" onclick="closeEdit()">Cancel</button>
+      <button class="btn-save" onclick="saveEdit()">Save</button>
+    </div>
+  </div>
 </div>
 <script>
 let chart;
@@ -327,9 +397,47 @@ async function load(){
         <div class="date">${fmt(s.start_time)}</div>
         <div class="meta">${dur(s.duration)} &middot; ${s.avg_pace}s/rep</div>
       </div>
-      <div class="reps">${s.reps}</div>
+      <div class="right">
+        <div class="actions">
+          <button class="action-btn" onclick="openEdit(${s.id},${s.reps})">edit</button>
+          <button class="action-btn del" onclick="delSet(${s.id})">del</button>
+        </div>
+        <div class="reps">${s.reps}</div>
+      </div>
     </div>`).join('');
 }
+
+let editId=null;
+function openEdit(id,reps){
+  editId=id;
+  document.getElementById('editReps').value=reps;
+  document.getElementById('editModal').classList.add('active');
+  document.getElementById('editReps').focus();
+}
+function closeEdit(){
+  document.getElementById('editModal').classList.remove('active');
+  editId=null;
+}
+async function saveEdit(){
+  const reps=parseInt(document.getElementById('editReps').value);
+  if(!reps||reps<1)return;
+  await fetch('/api/sessions/'+editId,{method:'PATCH',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({reps})});
+  closeEdit();
+  load();
+}
+async function delSet(id){
+  if(!confirm('Delete this set?'))return;
+  await fetch('/api/sessions/'+id,{method:'DELETE'});
+  load();
+}
+document.getElementById('editModal').addEventListener('click',function(e){
+  if(e.target===this)closeEdit();
+});
+document.getElementById('editReps').addEventListener('keydown',function(e){
+  if(e.key==='Enter')saveEdit();
+  if(e.key==='Escape')closeEdit();
+});
 
 load();
 setInterval(load,30000);
